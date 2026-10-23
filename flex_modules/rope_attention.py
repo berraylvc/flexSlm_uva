@@ -1,0 +1,125 @@
+"""
+rope operation largely adapted from https://github.com/meta-llama/codellama/blob/main/llama/model.py
+"""
+
+from typing import Iterable
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+from flex_modules.linear import Linear
+from flex_modules.rmsnorm import _RMSNormBase
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    # x:   [B, H, S, head_dim]
+    # cos/sin: [S, head_dim], broadcast over B and H dims
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    return x * cos + _rotate_half(x) * sin
+
+
+def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    # x: [B, num_kv_heads, S, head_dim] -> [B, num_kv_heads * n_rep, S, head_dim]
+    if n_rep == 1:
+        return x
+    B, num_kv_heads, S, head_dim = x.shape
+    return x[:, :, None, :, :].expand(
+        B, num_kv_heads, n_rep, S, head_dim
+    ).reshape(B, num_kv_heads * n_rep, S, head_dim)
+
+
+class RoPEAttention(nn.Module):
+    """
+    Causal self-attention with Rotary Position Embeddings (RoPE) and grouped-query
+    attention (num_kv_heads may be less than num_heads, LLaMA/Qwen convention).
+    """
+
+    def __init__(
+        self,
+        hidden_dims: Iterable[int],
+        num_heads: Iterable[int],
+        num_kv_heads: Iterable[int] = None,
+        rope_theta: float = 10000.0,
+        max_seq_len: int = 1024,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        rms_norm_eps: float = 1e-6,
+    ):
+        super().__init__()
+        hidden_dims = list(hidden_dims)
+        num_heads = list(num_heads)
+        num_kv_heads = list(num_kv_heads) if num_kv_heads is not None else list(num_heads)
+        assert len(hidden_dims) == len(num_heads) == len(num_kv_heads)
+        assert all(h % n == 0 for h, n in zip(hidden_dims, num_heads))
+        assert all(n % kv == 0 for n, kv in zip(num_heads, num_kv_heads))
+
+        self.hidden_dims = hidden_dims
+        self.num_heads_list = num_heads
+        self.num_kv_heads_list = num_kv_heads
+
+        head_dims = [h // n for h, n in zip(hidden_dims, num_heads)]
+        kv_dims = [kv * hd for kv, hd in zip(num_kv_heads, head_dims)]
+
+        # LLaMA convention: no bias anywhere. Qwen2 convention: q/k/v carry bias,
+        # o_proj does not - qkv_bias selects between the two.
+        self.q_proj = Linear(hidden_dims, hidden_dims, bias=qkv_bias)
+        self.k_proj = Linear(hidden_dims, kv_dims, bias=qkv_bias)
+        self.v_proj = Linear(hidden_dims, kv_dims, bias=qkv_bias)
+        self.o_proj = Linear(hidden_dims, hidden_dims, bias=False)
+
+        # Qwen3 convention: per-head RMSNorm on q and k before RoPE. The weights
+        # have size head_dim, so they are shared by every level as long as all
+        # levels keep the same head_dim (which _flex_llama_dims guarantees).
+        self.qk_norm = qk_norm
+        if qk_norm:
+            assert len(set(head_dims)) == 1, "qk_norm needs the same head_dim on every level"
+            self.q_norm = _RMSNormBase(head_dims[0], eps=rms_norm_eps)
+            self.k_norm = _RMSNormBase(head_dims[0], eps=rms_norm_eps)
+
+        # Precompute RoPE cos/sin per level.
+        for level in range(len(hidden_dims)):
+            head_dim = hidden_dims[level] // num_heads[level]
+            inv_freq = 1.0 / (
+                rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim)
+            )
+            t = torch.arange(max_seq_len).float()
+            freqs = torch.outer(t, inv_freq)          # [max_seq_len, head_dim // 2]
+            emb = torch.cat([freqs, freqs], dim=-1)   # [max_seq_len, head_dim]
+            self.register_buffer(f'cos_{level}', emb.cos())
+            self.register_buffer(f'sin_{level}', emb.sin())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, S, hidden_dim]
+        B, S, _ = x.shape
+        level = self.q_proj.current_level()
+        num_heads = self.num_heads_list[level]
+        num_kv_heads = self.num_kv_heads_list[level]
+        hidden_dim = self.hidden_dims[level]
+        head_dim = hidden_dim // num_heads
+
+        q = self.q_proj(x).view(B, S, num_heads, head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, S, num_kv_heads, head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, S, num_kv_heads, head_dim).transpose(1, 2)
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        cos = getattr(self, f'cos_{level}')[:S]   # [S, head_dim]
+        sin = getattr(self, f'sin_{level}')[:S]   # [S, head_dim]
+        q = _apply_rope(q, cos, sin)
+        k = _apply_rope(k, cos, sin)
+
+        n_rep = num_heads // num_kv_heads
+        k = _repeat_kv(k, n_rep)
+        v = _repeat_kv(v, n_rep)
+
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = out.transpose(1, 2).contiguous().view(B, S, hidden_dim)
+        return self.o_proj(out)

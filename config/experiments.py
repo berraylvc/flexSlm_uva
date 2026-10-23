@@ -1,0 +1,979 @@
+from networks.flexgpt import FlexGPT, FlexGPTConfig
+from networks.flexllama import FlexLLaMA, FlexLLaMAConfig
+from training import *
+from training import FlexLMTrainer
+
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from functools import partial
+import torch
+import torch.optim as optim
+
+from training import FlexLMTrainer, FlexLMKDTrainer
+from training_memopt import MemOptFlexLMKDTrainer, memopt
+
+
+class GPTTrainingContext(FlexTrainingContext):
+    warmup_epochs: int = 10
+    num_levels_per_step: int = None  # None = train all levels; set e.g. 2 to sample
+
+    def __init__(self, dataset_name="wikitext-103-raw-v1",
+                 max_seq_length=1024, batch_size=8,
+                 num_levels_per_step=None,
+                 patience=5, epochs=20,
+                 *args, **kwargs):
+        loader = partial(utils.load_wikitext, dataset_name=dataset_name,
+                         max_seq_length=max_seq_length, batch_size=batch_size)
+        super().__init__(loader, patience=patience, epochs=epochs, *args, **kwargs)
+        self.num_levels_per_step = num_levels_per_step
+
+    def make_optimizer(self, model):
+        return optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
+
+    def make_scheduler(self, optimizer):
+        warmup = LinearLR(optimizer, start_factor=0.1, total_iters=self.warmup_epochs)
+        cosine = CosineAnnealingLR(optimizer, T_max=max(1, self.epochs - self.warmup_epochs), eta_min=1e-5)
+        return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[self.warmup_epochs])
+
+
+@dataclasses.dataclass
+class FlexLMKDTrainingContext(GPTTrainingContext):
+    kd_lambda: float = 0.5
+    kd_temperature: float = 2.0
+    teacher_hf_model: str = 'gpt2'
+
+    def __init__(self, kd_lambda=0.5, kd_temperature=2.0,
+                teacher_hf_model='gpt2',
+                dataset="wikitext-103-raw-v1",
+                max_seq_length=1024, batch_size=8,
+                num_levels_per_step=None, patience=5, epochs=20,
+                *args, **kwargs):
+        loader = partial(utils.load_wikitext, dataset_name=dataset,
+                        max_seq_length=max_seq_length, batch_size=batch_size)
+        FlexTrainingContext.__init__(self, loader, patience=patience, epochs=epochs, *args, **kwargs)
+        self.warmup_epochs = 2
+        self.num_levels_per_step = num_levels_per_step
+        self.kd_lambda = kd_lambda
+        self.kd_temperature = kd_temperature
+        self.teacher_hf_model = teacher_hf_model
+
+
+class LLaMATrainingContext(GPTTrainingContext):
+    """Training context for FlexLLaMA. Defaults to FineWeb-Edu."""
+
+    def __init__(self, dataset="fineweb-edu", max_seq_length=1024, batch_size=8,
+                 num_levels_per_step=None, patience=3, epochs=10,
+                 max_examples=150_000, max_tokens=None, *args, **kwargs):
+        if dataset == "fineweb-edu":
+            loader = partial(utils.load_fineweb_edu,
+                             max_seq_length=max_seq_length,
+                             batch_size=batch_size,
+                             max_examples=max_examples,
+                             max_tokens=max_tokens)
+        elif dataset == "fineweb-edu-memmap":
+            loader = partial(utils.load_fineweb_edu_memmap,
+                             max_seq_length=max_seq_length,
+                             batch_size=batch_size)
+        else:
+            loader = partial(utils.load_wikitext, dataset_name=dataset,
+                             max_seq_length=max_seq_length,
+                             batch_size=batch_size)
+        FlexTrainingContext.__init__(self, loader, patience=patience, epochs=epochs, *args, **kwargs)
+        self.warmup_epochs = 2
+        self.num_levels_per_step = num_levels_per_step
+
+
+@dataclasses.dataclass
+class LLaMAKDTrainingContext(FlexLMKDTrainingContext):
+    """KD training context for FlexLLaMA, Uses FineWeb-Edu and llama-160m as teacher."""
+
+    def __init__(self, kd_lambda=1.0, kd_temperature=2.0,
+                 teacher_hf_model='JackFram/llama-160m',
+                 tokenizer_name='JackFram/llama-160m',
+                 dataset="fineweb-edu", max_seq_length=1024, batch_size=8,
+                 num_levels_per_step=None, patience=3, epochs=10,
+                 max_examples=150_000, max_tokens=None, map_workers=None, *args, **kwargs):
+        if dataset == "fineweb-edu":
+            loader = partial(utils.load_fineweb_edu,
+                             max_seq_length=max_seq_length,
+                             batch_size=batch_size,
+                             max_examples=max_examples,
+                             max_tokens=max_tokens,
+                             tokenizer_name=tokenizer_name,
+                             map_workers=map_workers)
+        elif dataset == "fineweb-edu-memmap":
+            loader = partial(utils.load_fineweb_edu_memmap,
+                             max_seq_length=max_seq_length,
+                             batch_size=batch_size,
+                             tokenizer_name=tokenizer_name)
+        else:
+            loader = partial(utils.load_wikitext, dataset_name=dataset,
+                             max_seq_length=max_seq_length,
+                             batch_size=batch_size)
+        FlexTrainingContext.__init__(self, loader, patience=patience, epochs=epochs, *args, **kwargs)
+        self.warmup_epochs = 2
+        self.num_levels_per_step = num_levels_per_step
+        self.kd_lambda = kd_lambda
+        self.kd_temperature = kd_temperature
+        self.teacher_hf_model = teacher_hf_model
+
+
+torch.serialization.add_safe_globals([GPTTrainingContext, FlexLMKDTrainingContext, LLaMATrainingContext, LLaMAKDTrainingContext])
+
+
+def _flex_llama_dims(hidden, heads, kv_heads, intermediate, n_levels=3, min_frac=None, fractions=None):
+    """
+    Builds increasing (hidden_dims, num_heads, num_kv_heads, intermediate_dims)
+    tuples for a multi-level FlexLLaMAConfig whose max level exactly matches a
+    real checkpoint's dims (required for pretrained_hf_model warm-starting).
+    Smaller levels keep the same head_dim and pick the largest kv_heads that
+    still evenly divides that level's head count - they need not preserve the
+    teacher's exact GQA ratio, only the max level does.
+
+    n_levels total levels are generated: min_frac (default 1/n_levels) at the
+    bottom, 1.0 (the checkpoint's real size) at the top, and n_levels - 2 more
+    evenly spaced in between. Pass fractions explicitly to override this spacing.
+    """
+    if fractions is None:
+        if min_frac is None:
+            min_frac = 1.0 / n_levels
+        fractions = [1.0] if n_levels == 1 else [
+            min_frac + (1.0 - min_frac) * i / (n_levels - 1) for i in range(n_levels)
+        ]
+
+    head_dim = hidden // heads
+
+    def kv_for(h):
+        for kv in range(min(h, kv_heads), 0, -1):
+            if h % kv == 0:
+                return kv
+        return 1
+
+    hs, hd, kvs, im = [], [], [], []
+    for i, frac in enumerate(fractions):
+        is_last = (i == len(fractions) - 1)
+        h = heads if is_last else min(heads, max(1, round(heads * frac)))
+        if hs and h <= hs[-1]:
+            h = hs[-1] + 1
+        hs.append(h)
+        hd.append(h * head_dim)
+        kvs.append(kv_for(h))
+
+        i_val = intermediate if is_last else min(intermediate, max(64, round(intermediate * frac / 64) * 64))
+        if im and i_val <= im[-1]:
+            i_val = im[-1] + 64
+        im.append(i_val)
+
+    return tuple(hd), tuple(hs), tuple(kvs), tuple(im)
+
+
+# Teacher presets for FlexLLaMA. Each entry's hf_model is used both as the frozen
+# KD teacher and as the tokenizer that pre-tokenizes the training corpus, so
+# student/teacher logits line up index-for-index over the vocab.
+#
+# Entries with full architecture fields (num_layers/hidden_dims/... below) support
+# pretrained_hf_model warm-starting via make_flexllama_warmstart_kd - the student's
+# max level is sized to match the checkpoint exactly, per utils.load_llama_weights_
+# into_flexllama's validation. llama3.2-1b/3b are gated on HF (need license + HF_TOKEN)
+# so their dims are unverified here; they're KD-only via make_flexllama_kd until
+# confirmed with llama_model_param_fetch.py.
+#
+# llama2-7b and llama3.1-8b are KD-teacher-only by design, not just unverified:
+# at 7-8B they're too wide to be warm-started as the flex student itself on this
+# hardware, so no dims_spec is provided for them. KD-only teacher loading (see
+# FlexLMKDTrainer) goes through plain AutoModelForCausalLM and is architecture-
+# agnostic, so this works regardless of size or HF model_type.
+#
+# Note: flex_modules.rope_attention.RoPEAttention only implements plain RoPE
+# (single rope_theta). Llama-3.x checkpoints (3.1/3.2) were pretrained with the
+# "llama3" rope_scaling extension on top of rope_theta=500000 for long-context
+# extrapolation, which this repo does not implement. Warm-starting a Llama-3.x
+# checkpoint (via make_flexllama_warmstart_kd) would copy correct weights but
+# apply a mismatched rotary frequency schedule - do not add dims_spec for
+# llama3.2-1b/3b until RoPEAttention supports rope_scaling. KD-only training
+# against them (as teacher) is unaffected since it never touches the student's
+# RoPE math.
+TEACHER_PRESETS = {
+    "llama-160m": dict(
+        hf_model="JackFram/llama-160m", vocab_size=32000, num_layers=12,
+        rope_theta=10000.0, rms_norm_eps=1e-6, tie_embeddings=False, qkv_bias=False,
+        dims_spec=dict(hidden=768, heads=12, kv_heads=12, intermediate=3072),
+    ),
+    "tinyllama-1.1b": dict(
+        hf_model="TinyLlama/TinyLlama-1.1B-Chat-v1.0", vocab_size=32000, num_layers=22,
+        rope_theta=10000.0, rms_norm_eps=1e-5, tie_embeddings=False, qkv_bias=False,
+        dims_spec=dict(hidden=2048, heads=32, kv_heads=4, intermediate=5632),
+    ),
+    "llama3.2-1b": dict(hf_model="meta-llama/Llama-3.2-1B", vocab_size=128256),  # gated on HF: dims unverified
+    "llama3.2-3b": dict(hf_model="meta-llama/Llama-3.2-3B", vocab_size=128256),  # gated on HF: dims unverified
+    "llama2-7b": dict(hf_model="meta-llama/Llama-2-7b-hf", vocab_size=32000),    # KD teacher only, no warm-start
+    "llama3.1-8b": dict(hf_model="meta-llama/Llama-3.1-8B", vocab_size=128256),  # KD teacher only, no warm-start
+    "smollm2-135m": dict(
+        hf_model="HuggingFaceTB/SmolLM2-135M", vocab_size=49152, num_layers=30,
+        rope_theta=100000.0, rms_norm_eps=1e-5, tie_embeddings=True, qkv_bias=False,
+        dims_spec=dict(hidden=576, heads=9, kv_heads=3, intermediate=1536),
+    ),
+    "smollm2-360m": dict(
+        hf_model="HuggingFaceTB/SmolLM2-360M", vocab_size=49152, num_layers=32,
+        rope_theta=100000.0, rms_norm_eps=1e-5, tie_embeddings=True, qkv_bias=False,
+        dims_spec=dict(hidden=960, heads=15, kv_heads=5, intermediate=2560),
+    ),
+    "smollm2-1.7b": dict(
+        hf_model="HuggingFaceTB/SmolLM2-1.7B", vocab_size=49152, num_layers=24,
+        rope_theta=130000.0, rms_norm_eps=1e-5, tie_embeddings=True, qkv_bias=False,
+        dims_spec=dict(hidden=2048, heads=32, kv_heads=32, intermediate=8192),
+    ),
+    "qwen2.5-0.5b": dict(
+        hf_model="Qwen/Qwen2.5-0.5B", vocab_size=151936, num_layers=24,
+        rope_theta=1000000.0, rms_norm_eps=1e-6, tie_embeddings=True, qkv_bias=True,
+        dims_spec=dict(hidden=896, heads=14, kv_heads=2, intermediate=4864),
+    ),
+    "qwen2.5-1.5b": dict(
+        hf_model="Qwen/Qwen2.5-1.5B", vocab_size=151936, num_layers=28,
+        rope_theta=1000000.0, rms_norm_eps=1e-6, tie_embeddings=True, qkv_bias=True,
+        dims_spec=dict(hidden=1536, heads=12, kv_heads=2, intermediate=8960),
+    ),
+    "qwen2.5coder-0.5b": dict(
+        hf_model="Qwen/Qwen2.5-Coder-0.5B", vocab_size=151936, num_layers=24,
+        rope_theta=1000000.0, rms_norm_eps=1e-6, tie_embeddings=True, qkv_bias=True,
+        dims_spec=dict(hidden=896, heads=14, kv_heads=2, intermediate=4864),
+    ),
+    "qwen2.5coder-1.5b": dict(
+        hf_model="Qwen/Qwen2.5-Coder-1.5B", vocab_size=151936, num_layers=28,
+        rope_theta=1000000.0, rms_norm_eps=1e-6, tie_embeddings=True, qkv_bias=True,
+        dims_spec=dict(hidden=1536, heads=12, kv_heads=2, intermediate=8960),
+    ),
+    # FaithMed's backbone: the post-trained (thinking) Qwen3-1.7B, not -Base.
+    # Qwen3 drops the q/k/v bias and adds per-head q/k RMSNorm (qk_norm).
+    "qwen3-1.7b": dict(
+        hf_model="Qwen/Qwen3-1.7B", vocab_size=151936, num_layers=28,
+        rope_theta=1000000.0, rms_norm_eps=1e-6, tie_embeddings=True, qkv_bias=False,
+        qk_norm=True,
+        dims_spec=dict(hidden=2048, heads=16, kv_heads=8, intermediate=6144),
+    ),
+}
+
+_WARMSTART_FIELDS = ("num_layers", "dims_spec", "rope_theta", "rms_norm_eps",
+                     "tie_embeddings", "qkv_bias")
+
+
+def _label_levels(kd_kwargs: dict, n_levels: int) -> dict:
+    """
+    Mutates kd_kwargs so every config self-documents its total levels and how
+    many are sampled per training step: defaults num_levels_per_step to n_levels
+    (all levels trained every step, the same as looping over all of them) unless
+    the caller overrides it, and appends "_{n_levels}L{sampled}S" to
+    wandb_project_name so both numbers are visible without opening the config.
+    """
+    kd_kwargs.setdefault("num_levels_per_step", n_levels)
+    sampled = kd_kwargs["num_levels_per_step"]
+    if kd_kwargs.get("wandb_project_name") is not None:
+        kd_kwargs["wandb_project_name"] += f"_{n_levels}L{sampled}S"
+    return kd_kwargs
+
+
+def flexllama_scaling_params(cfg: FlexLLaMAConfig) -> int:
+    """
+    Parameter count at the max flex level using nanochat's scaling-law convention:
+    transformer blocks + lm_head, with token embeddings excluded (Kaplan-style).
+    See nanochat/nanochat/gpt.py:num_scaling_params.
+
+    Computed from the config dims rather than by building the model, so it is
+    cheap enough to evaluate at import time. The max level is the right unit
+    because every smaller level is a slice of those same tensors.
+
+    Note: nanochat's lm_head is always untied, so it counts as its own group. We
+    count hidden*vocab_size here whether or not tie_embeddings is set, keeping the
+    output projection in the horizon - it dominates FLOPs at Qwen-scale vocabs.
+    """
+    hidden = list(cfg.hidden_dims)[-1]
+    heads = list(cfg.num_heads)[-1]
+    kv_heads = list(cfg.num_kv_heads)[-1]
+    inter = list(cfg.intermediate_dims)[-1]
+    kv_dim = kv_heads * (hidden // heads)
+
+    attn = 2 * hidden * hidden + 2 * kv_dim * hidden   # q,o + k,v
+    if cfg.qkv_bias:
+        attn += hidden + 2 * kv_dim
+    mlp = 3 * hidden * inter                            # gate, up, down (SwiGLU)
+    norms = 2 * hidden                                  # input + post-attention RMSNorm
+    lm_head = hidden * cfg.vocab_size
+    return cfg.num_layers * (attn + mlp + norms) + lm_head
+
+
+def nanochat_token_horizon(cfg: FlexLLaMAConfig, data_param_ratio: float = 12) -> int:
+    """
+    Training-token budget following nanochat's recipe: tokens = ratio x scaling
+    params, trained for a single pass rather than many epochs over a small slice.
+    Their default ratio is 12 and runs/speedrun.sh uses 8; Chinchilla is 20.
+    """
+    return int(data_param_ratio * flexllama_scaling_params(cfg))
+
+
+def make_flexllama_kd(teacher: str, **kd_kwargs) -> TrainerBuilder:
+    """Builds a FlexLLaMA KD TrainerBuilder for the named entry in TEACHER_PRESETS.
+    Student starts from random init and is trained purely via KD logits."""
+    preset = TEACHER_PRESETS[teacher]
+    n_levels = len(FlexLLaMAConfig().hidden_dims)
+    kd_kwargs = _label_levels(kd_kwargs, n_levels)
+    return TrainerBuilder(
+        FlexLMKDTrainer,
+        FlexLLaMAConfig(vocab_size=preset["vocab_size"]),
+        LLaMAKDTrainingContext(
+            teacher_hf_model=preset["hf_model"],
+            tokenizer_name=preset["hf_model"],
+            **kd_kwargs,
+        ),
+    )
+
+
+def make_flexllama_warmstart_kd(teacher: str, n_levels: int = 3, min_frac: float = None,
+                                 memory_optimized: bool = False, loss_chunk_size: int = 1024,
+                                 kd_teacher: str = None, **kd_kwargs) -> TrainerBuilder:
+    """Same KD training algorithm as make_flexllama_kd, but the student's max
+    level is built to match `teacher`'s real architecture exactly and is
+    warm-started from its pretrained weights (FlexLLaMAConfig.pretrained_hf_model),
+    rather than starting from random init.
+
+    By default the same preset is also the frozen KD teacher (warm-start "self").
+    Pass kd_teacher to distill against a different, larger TEACHER_PRESETS entry
+    instead - e.g. warm-start-and-KD-self from qwen2.5-0.5b's own weights while
+    matching logits against qwen2.5-1.5b. kd_teacher must share the warm-start
+    preset's tokenizer/vocab_size: KD compares logit distributions index-for-index
+    over the vocab (see the TEACHER_PRESETS module docstring), so a vocab mismatch
+    would silently misalign student and teacher logits rather than error - this is
+    checked explicitly below since nothing else would catch it.
+
+    n_levels controls how many flex levels the student has in total (min_frac at
+    the bottom, the checkpoint's real size at the top, evenly spaced in between -
+    see _flex_llama_dims). Training all n_levels every step gets expensive as
+    n_levels grows; pass num_levels_per_step in kd_kwargs to sample a subset per
+    step instead of training every level each time.
+
+    memory_optimized swaps in training_memopt.MemOptFlexLMKDTrainer (chunked loss
+    + activation checkpointing). The training algorithm is unchanged and the
+    gradients are identical - it only lowers peak memory, which is what the
+    1.5B-class teachers need to fit. loss_chunk_size trades peak memory against
+    the number of chunked loss passes.
+    """
+    preset = TEACHER_PRESETS[teacher]
+    missing = [f for f in _WARMSTART_FIELDS if f not in preset]
+    if missing:
+        raise ValueError(
+            f"TEACHER_PRESETS[{teacher!r}] is missing {missing} - warm-starting "
+            f"needs the full architecture spec (see llama_model_param_fetch.py). "
+            f"Use make_flexllama_kd for KD-only training against this teacher."
+        )
+    kd_preset = TEACHER_PRESETS[kd_teacher] if kd_teacher is not None else preset
+    if kd_preset["vocab_size"] != preset["vocab_size"]:
+        raise ValueError(
+            f"kd_teacher={kd_teacher!r} has vocab_size={kd_preset['vocab_size']}, "
+            f"which does not match warm-start preset {teacher!r}'s "
+            f"vocab_size={preset['vocab_size']}. KD requires student/teacher "
+            f"logits to line up index-for-index over a shared vocab/tokenizer."
+        )
+    hidden_dims, num_heads, num_kv_heads, intermediate_dims = _flex_llama_dims(
+        **preset["dims_spec"], n_levels=n_levels, min_frac=min_frac)
+    kd_kwargs = _label_levels(kd_kwargs, n_levels)
+    builder = TrainerBuilder(
+        MemOptFlexLMKDTrainer if memory_optimized else FlexLMKDTrainer,
+        FlexLLaMAConfig(
+            vocab_size=preset["vocab_size"],
+            num_layers=preset["num_layers"],
+            hidden_dims=hidden_dims,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            intermediate_dims=intermediate_dims,
+            rope_theta=preset["rope_theta"],
+            rms_norm_eps=preset["rms_norm_eps"],
+            tie_embeddings=preset["tie_embeddings"],
+            qkv_bias=preset["qkv_bias"],
+            qk_norm=preset.get("qk_norm", False),
+            pretrained_hf_model=preset["hf_model"],
+        ),
+        LLaMAKDTrainingContext(
+            teacher_hf_model=kd_preset["hf_model"],
+            tokenizer_name=preset["hf_model"],
+            **kd_kwargs,
+        ),
+    )
+    if memory_optimized:
+        memopt(builder.training_context, loss_chunk_size=loss_chunk_size)
+    return builder
+
+
+CONFIGS = {
+    'flexgpt': {
+        'wikitext103.3levels': TrainerBuilder(
+            FlexLMTrainer,
+            FlexGPTConfig(
+                vocab_size=50257,
+                max_seq_length=1024,
+                num_layers=12,
+                hidden_dims=(384, 512, 768),
+                num_heads=(6, 8, 12),
+                mlp_dims=(1536, 2048, 3072),
+                dropout=0.1,
+            ),
+            GPTTrainingContext(wandb_project_name="FlexGPT_wikitext103"),
+        ),
+        'wikitext2.3levels': TrainerBuilder(
+            FlexLMTrainer,
+            FlexGPTConfig(
+                vocab_size=50257,
+                max_seq_length=1024,
+                num_layers=12,
+                hidden_dims=(384, 512, 768),
+                num_heads=(6, 8, 12),
+                mlp_dims=(1536, 2048, 3072),
+                dropout=0.1,
+            ),
+            GPTTrainingContext(dataset_name="wikitext-2-raw-v1"),
+        ),
+        'wikitext103.gpt2pretrained': TrainerBuilder(
+            FlexLMTrainer,
+            FlexGPTConfig(
+                vocab_size=50257,
+                max_seq_length=1024,
+                num_layers=12,
+                hidden_dims=(384, 512, 768),
+                num_heads=(6, 8, 12),
+                mlp_dims=(1536, 2048, 3072),
+                dropout=0.1,
+                pretrained_hf_model="gpt2",
+            ),
+            GPTTrainingContext(wandb_project_name="FlexGPT_wikitext103_pretrained", epochs=5, patience=3),
+        ),
+        'wikitext2.gpt2pretrained': TrainerBuilder(
+            FlexLMTrainer,
+            FlexGPTConfig(
+                vocab_size=50257,
+                max_seq_length=1024,
+                num_layers=12,
+                hidden_dims=(384, 512, 768),
+                num_heads=(6, 8, 12),
+                mlp_dims=(1536, 2048, 3072),
+                dropout=0.1,
+                pretrained_hf_model="gpt2",
+            ),
+            GPTTrainingContext(dataset_name="wikitext-2-raw-v1"),
+        ),
+        'wikitext2.tiny': TrainerBuilder(
+            FlexLMTrainer,
+            FlexGPTConfig(
+                vocab_size=50257,
+                max_seq_length=256,
+                num_layers=2,
+                hidden_dims=(192, 256, 384),
+                num_heads=(3, 4, 6),
+                mlp_dims=(768, 1024, 1536),
+                dropout=0.1,
+            ),
+            GPTTrainingContext(
+                dataset_name="wikitext-2-raw-v1",
+                max_seq_length=256,
+                batch_size=4,
+                epochs=5,
+                wandb_project_name="FlexGPT",
+            ),
+        ),
+        'wikitext103.kd_tiny': TrainerBuilder(
+            FlexLMKDTrainer,
+            FlexGPTConfig(
+                vocab_size=50257,
+                max_seq_length=1024,
+                num_layers=12,
+                hidden_dims=(384, 512, 768),
+                num_heads=(6, 8, 12),
+                mlp_dims=(1536, 2048, 3072),
+                dropout=0.1,
+                pretrained_hf_model="gpt2",
+            ),
+            FlexLMKDTrainingContext(
+                kd_lambda=1.0,
+                kd_temperature=2.0,
+                dataset="wikitext-103-raw-v1",
+                batch_size=8,
+                epochs=1,
+                patience=1,
+                wandb_project_name="FlexGPT_wikitext103_kd",
+            ),
+        ),
+        'wikitext103.kd_from_gpt2': TrainerBuilder(
+            FlexLMKDTrainer,
+            FlexGPTConfig(
+                vocab_size=50257,
+                max_seq_length=1024,
+                num_layers=12,
+                hidden_dims=(384, 512, 768),
+                num_heads=(6, 8, 12),
+                mlp_dims=(1536, 2048, 3072),
+                dropout=0.1,
+                pretrained_hf_model="gpt2",
+            ),
+            FlexLMKDTrainingContext(
+                kd_lambda=1.0,
+                kd_temperature=2.0,
+                dataset="wikitext-103-raw-v1",
+                batch_size=8,
+                epochs=5,
+                patience=3,
+                wandb_project_name="FlexGPT_wikitext103_kd",
+            ),
+        ),
+        'openwebtext.kd_from_gpt2': TrainerBuilder(
+            FlexLMKDTrainer,
+            FlexGPTConfig(
+                vocab_size=50257,
+                max_seq_length=1024,
+                num_layers=12,
+                hidden_dims=(384, 512, 768),
+                num_heads=(6, 8, 12),
+                mlp_dims=(1536, 2048, 3072),
+                dropout=0.1,
+                pretrained_hf_model="gpt2",
+            ),
+            FlexLMKDTrainingContext(
+                kd_lambda=0.5,
+                kd_temperature=2.0,
+                batch_size=32,
+                epochs=3,
+                patience=3,
+                wandb_project_name="FlexGPT_openwebtext_kd",
+            ),
+        ),
+        'fineweb.kd_lambda05': TrainerBuilder(
+            FlexLMKDTrainer,
+            FlexGPTConfig(
+                vocab_size=50257,
+                max_seq_length=1024,
+                num_layers=12,
+                hidden_dims=(384, 512, 768),
+                num_heads=(6, 8, 12),
+                mlp_dims=(1536, 2048, 3072),
+                dropout=0.1,
+                pretrained_hf_model="gpt2",
+            ),
+            LLaMAKDTrainingContext(
+                kd_lambda=0.5,
+                kd_temperature=2.0,
+                teacher_hf_model='gpt2',
+                tokenizer_name='gpt2',
+                epochs=10,
+                patience=3,
+                wandb_project_name="FlexGPT_fineweb_kd_lambda05",
+            ),
+        ),
+        'wikitext103.kd_from_gpt2_lambda05': TrainerBuilder(
+            FlexLMKDTrainer,
+            FlexGPTConfig(
+                vocab_size=50257,
+                max_seq_length=1024,
+                num_layers=12,
+                hidden_dims=(384, 512, 768),
+                num_heads=(6, 8, 12),
+                mlp_dims=(1536, 2048, 3072),
+                dropout=0.1,
+                pretrained_hf_model="gpt2",
+            ),
+            FlexLMKDTrainingContext(
+                kd_lambda=0.5,
+                kd_temperature=2.0,
+                dataset="wikitext-103-raw-v1",
+                batch_size=8,
+                epochs=10,
+                patience=3,
+                wandb_project_name="FlexGPT_wikitext103_kd_lambda05",
+            ),
+        ),
+    }, 'flexllama': {
+        'fineweb.3levels': TrainerBuilder(
+            FlexLMTrainer,
+            FlexLLaMAConfig(),
+            LLaMATrainingContext(
+                wandb_project_name="FlexLLaMA_fineweb",
+            ),
+        ),
+        'fineweb.pretrained': TrainerBuilder(
+            FlexLMTrainer,
+            FlexLLaMAConfig(
+                pretrained_hf_model="JackFram/llama-160m",
+            ),
+            LLaMATrainingContext(
+                wandb_project_name="FlexLLaMA_fineweb_pretrained",
+                epochs=5,
+            ),
+        ),
+        'fineweb.tiny': TrainerBuilder(
+            FlexLMTrainer,
+            FlexLLaMAConfig(
+                pretrained_hf_model="JackFram/llama-160m",
+            ),
+            LLaMATrainingContext(
+                dataset="fineweb-edu",
+                epochs=1,
+                patience=1,
+                wandb_project_name="FlexLLaMA_fineweb_pretrained_tiny",
+            ),
+        ),
+        'fineweb.kd_pure': TrainerBuilder(
+            FlexLMKDTrainer,
+            FlexLLaMAConfig(
+                pretrained_hf_model="JackFram/llama-160m",
+            ),
+            LLaMAKDTrainingContext(
+                kd_lambda=1.0,
+                kd_temperature=2.0,
+                epochs=5,
+                patience=3,
+                wandb_project_name="FlexLLaMA_fineweb_kd_pure",
+            ),
+        ),
+        'fineweb.kd_lambda05': TrainerBuilder(
+            FlexLMKDTrainer,
+            FlexLLaMAConfig(
+                pretrained_hf_model="JackFram/llama-160m",
+            ),
+            LLaMAKDTrainingContext(
+                kd_lambda=0.5,
+                kd_temperature=2.0,
+                epochs=10,
+                patience=3,
+                wandb_project_name="FlexLLaMA_fineweb_kd_lambda05",
+            ),
+        ),
+        'fineweb.kd_lambda05_1p4B': TrainerBuilder(
+            FlexLMKDTrainer,
+            FlexLLaMAConfig(
+                pretrained_hf_model="JackFram/llama-160m",
+            ),
+            LLaMAKDTrainingContext(
+                kd_lambda=0.5,
+                kd_temperature=2.0,
+                max_examples=2_000_000,  # ~1.4B tokens at ~700 tok/doc, up from the 100M-token default
+                map_workers=1,  # 4 DDP ranks each tokenize independently; num_proc=4 per rank OOM'd the node
+                epochs=3,
+                patience=3,
+                wandb_project_name="FlexLLaMA_fineweb_kd_lambda05_1p4B",
+            ),
+        ),
+        'fineweb.kd_lambda05_10B': TrainerBuilder(
+            FlexLMKDTrainer,
+            FlexLLaMAConfig(
+                pretrained_hf_model="JackFram/llama-160m",
+            ),
+            LLaMAKDTrainingContext(
+                kd_lambda=0.5,
+                kd_temperature=2.0,
+                max_tokens=10_000_000_000,  # ~all of sample-10BT - the largest slice available without
+                                            # changing the HF split name in utils.load_fineweb_edu
+                map_workers=1,  # 4 DDP ranks each tokenize independently; num_proc=4 per rank OOM'd at 1.4B already
+                epochs=1,
+                patience=1,
+                wandb_project_name="FlexLLaMA_fineweb_kd_lambda05_10B",
+            ),
+        ),
+        'fineweb.kd_tinyllama': make_flexllama_kd(
+            "tinyllama-1.1b",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_tinyllama",
+        ),
+        'fineweb.kd_llama32_1b': make_flexllama_kd(
+            "llama3.2-1b",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_llama32_1b",
+        ),
+        'fineweb.kd_smollm2_360m': make_flexllama_kd(
+            "smollm2-360m",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_smollm2_360m",
+        ),
+        'fineweb.kd_smollm2_1p7b': make_flexllama_kd(
+            "smollm2-1.7b",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_smollm2_1p7b",
+        ),
+        'fineweb.kd_qwen25_0p5b': make_flexllama_kd(
+            "qwen2.5-0.5b",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_qwen25_0p5b",
+        ),
+        'fineweb.kd_qwen25_1p5b': make_flexllama_kd(
+            "qwen2.5-1.5b",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_qwen25_1p5b",
+        ),
+        'fineweb.kd_tinyllama_warmstart': make_flexllama_warmstart_kd(
+            "tinyllama-1.1b",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_tinyllama_warmstart",
+        ),
+        'fineweb.kd_tinyllama_warmstart_5levels': make_flexllama_warmstart_kd(
+            "tinyllama-1.1b", n_levels=5,
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            num_levels_per_step=3,  # min+max always included, 1 more sampled from the middle
+            wandb_project_name="FlexLLaMA_fineweb_kd_tinyllama_warmstart_5levels",
+        ),
+        'fineweb.kd_tinyllama_warmstart_7levels': make_flexllama_warmstart_kd(
+            "tinyllama-1.1b", n_levels=7,
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            num_levels_per_step=3,  # min+max always included, 1 more sampled from the middle
+            wandb_project_name="FlexLLaMA_fineweb_kd_tinyllama_warmstart_7levels",
+        ),
+        'fineweb.kd_tinyllama_warmstart_10levels': make_flexllama_warmstart_kd(
+            "tinyllama-1.1b", n_levels=10,
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            num_levels_per_step=3,  # 10 levels/step would be 10x the fwd+bwd cost; sample a subset instead
+            wandb_project_name="FlexLLaMA_fineweb_kd_tinyllama_warmstart_10levels",
+        ),
+        'fineweb.kd_smollm2_360m_warmstart': make_flexllama_warmstart_kd(
+            "smollm2-360m",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_smollm2_360m_warmstart",
+        ),
+        'fineweb.kd_smollm2_1p7b_warmstart': make_flexllama_warmstart_kd(
+            "smollm2-1.7b",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_smollm2_1p7b_warmstart",
+        ),
+        'fineweb.kd_qwen25_0p5b_warmstart': make_flexllama_warmstart_kd(
+            "qwen2.5-0.5b",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_qwen25_0p5b_warmstart",
+        ),
+        'fineweb.kd_qwen25_1p5b_warmstart': make_flexllama_warmstart_kd(
+            "qwen2.5-1.5b",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            # DDP + batch_size=4 still OOM'd on the KD softmax/KL-div step (46.15GB/47.4GB).
+            # FSDP would help but is incompatible with _step()'s per-level manual_backward
+            # loop (FSDP hook state machine breaks on >1 forward/backward per training_step -
+            # see use_fsdp on TrainingContext). Staying on DDP, cutting batch_size further instead.
+            batch_size=2,
+            wandb_project_name="FlexLLaMA_fineweb_kd_qwen25_1p5b_warmstart",
+        ),
+        'fineweb.kd_smollm2_135m_warmstart': make_flexllama_warmstart_kd(
+            "smollm2-135m",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_smollm2_135m_warmstart",
+        ),
+        'fineweb.kd_qwen25coder_0p5b_warmstart': make_flexllama_warmstart_kd(
+            "qwen2.5coder-0.5b",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_qwen25coder_0p5b_warmstart",
+        ),
+        'fineweb.kd_qwen25coder_1p5b_warmstart': make_flexllama_warmstart_kd(
+            "qwen2.5coder-1.5b",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            batch_size=2,  # same 1.5B-class memory profile as kd_qwen25_1p5b_warmstart above
+            wandb_project_name="FlexLLaMA_fineweb_kd_qwen25coder_1p5b_warmstart",
+        ),
+        # "Bigger teacher" combos: student is warm-started from its own (smaller)
+        # checkpoint via `teacher`, but KD-distilled against a separate, larger
+        # TEACHER_PRESETS entry via kd_teacher - both must share a tokenizer/vocab
+        # (enforced in make_flexllama_warmstart_kd) so student/teacher logits line
+        # up index-for-index.
+        'fineweb.kd_qwen25coder_0p5b_warmstart_bigteacher': make_flexllama_warmstart_kd(
+            "qwen2.5coder-0.5b", kd_teacher="qwen2.5coder-1.5b",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_qwen25coder_0p5b_warmstart_bigteacher",
+        ),
+        'fineweb.kd_tinyllama_warmstart_bigteacher': make_flexllama_warmstart_kd(
+            "tinyllama-1.1b", kd_teacher="llama2-7b",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_tinyllama_warmstart_bigteacher",
+        ),
+        # Memory-optimized variants: identical algorithm and gradients to the configs
+        # above (see training_memopt.py), just lower peak memory - which is what lets
+        # the 1.5B/1.7B-class teachers keep a usable batch_size instead of shrinking it.
+        'fineweb.kd_qwen25_1p5b_warmstart_memopt': make_flexllama_warmstart_kd(
+            "qwen2.5-1.5b", memory_optimized=True, loss_chunk_size=512,
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            batch_size=4,
+            wandb_project_name="FlexLLaMA_fineweb_kd_qwen25_1p5b_warmstart_memopt",
+        ),
+        'fineweb.kd_smollm2_1p7b_warmstart_memopt': make_flexllama_warmstart_kd(
+            "smollm2-1.7b", memory_optimized=True, loss_chunk_size=512,
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            batch_size=4,
+            wandb_project_name="FlexLLaMA_fineweb_kd_smollm2_1p7b_warmstart_memopt",
+        ),
+        'fineweb.kd_qwen25_0p5b_warmstart_memopt': make_flexllama_warmstart_kd(
+            "qwen2.5-0.5b", memory_optimized=True, loss_chunk_size=512,
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_qwen25_0p5b_warmstart_memopt",
+        ),
+        'fineweb.kd_tinyllama_warmstart_memopt': make_flexllama_warmstart_kd(
+            "tinyllama-1.1b", memory_optimized=True, loss_chunk_size=512,
+            kd_lambda=0.5, kd_temperature=2.0, epochs=10, patience=3,
+            wandb_project_name="FlexLLaMA_fineweb_kd_tinyllama_warmstart_memopt",
+        ),
+        # --- memmap data pipeline (dataset="fineweb-edu-memmap") ---
+        # Same training algorithm as the streaming configs above; only the data
+        # pipeline differs - pre-tokenized .bin files read via np.memmap instead of
+        # re-tokenizing the HF stream every epoch. Requires a one-off prepare pass
+        # per tokenizer first:  sbatch prepare_fineweb.sh <hf-tokenizer-name>
+        'fineweb_mm.kd_lambda05': TrainerBuilder(
+            FlexLMKDTrainer,
+            FlexLLaMAConfig(pretrained_hf_model="JackFram/llama-160m"),
+            LLaMAKDTrainingContext(
+                dataset="fineweb-edu-memmap",
+                kd_lambda=0.5, kd_temperature=2.0, epochs=3, patience=3,
+                wandb_project_name="FlexLLaMA_finewebmm_kd_lambda05",
+            ),
+        ),
+        'fineweb_mm.kd_tinyllama_warmstart': make_flexllama_warmstart_kd(
+            "tinyllama-1.1b", dataset="fineweb-edu-memmap",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=3, patience=3,
+            wandb_project_name="FlexLLaMA_finewebmm_kd_tinyllama_warmstart",
+        ),
+        'fineweb_mm.kd_qwen25_1p5b_warmstart_memopt': make_flexllama_warmstart_kd(
+            "qwen2.5-1.5b", dataset="fineweb-edu-memmap",
+            memory_optimized=True, loss_chunk_size=512,
+            kd_lambda=0.5, kd_temperature=2.0, epochs=3, patience=3,
+            batch_size=4,
+            wandb_project_name="FlexLLaMA_finewebmm_kd_qwen25_1p5b_warmstart_memopt",
+        ),
+        'fineweb_mm.kd_smollm2_1p7b_warmstart_memopt': make_flexllama_warmstart_kd(
+            "smollm2-1.7b", dataset="fineweb-edu-memmap",
+            memory_optimized=True, loss_chunk_size=512,
+            kd_lambda=0.5, kd_temperature=2.0, epochs=3, patience=3,
+            batch_size=4,
+            wandb_project_name="FlexLLaMA_finewebmm_kd_smollm2_1p7b_warmstart_memopt",
+        ),
+        # --- nanochat recipe (fineweb_nc.*) ---
+        # One pass over a horizon-sized corpus instead of several passes over a
+        # small slice: tokens = data_param_ratio x scaling params (nanochat uses
+        # 12 by default, 8 in runs/speedrun.sh; Chinchilla is 20), and epochs=1.
+        # Each needs its corpus prepared first at exactly that budget - the
+        # commands are in the comments below, and the horizons come from
+        # nanochat_token_horizon() (see test/test_nanochat_horizon.py).
+        #
+        # patience=1 because with a single epoch early stopping can only trigger
+        # on the mid-epoch validations (every ~1/20th of the run).
+        'fineweb_nc.kd_lambda05_r12': TrainerBuilder(
+            FlexLMKDTrainer,
+            FlexLLaMAConfig(pretrained_hf_model="JackFram/llama-160m"),
+            LLaMAKDTrainingContext(
+                dataset="fineweb-edu-memmap",
+                kd_lambda=0.5, kd_temperature=2.0, epochs=1, patience=1,
+                # sbatch prepare_fineweb.sh JackFram/llama-160m 1.654e9
+                wandb_project_name="FlexLLaMA_finewebnc_kd_lambda05_r12",
+            ),
+        ),
+        'fineweb_nc.kd_smollm2_360m_warmstart_r12': make_flexllama_warmstart_kd(
+            "smollm2-360m", dataset="fineweb-edu-memmap",
+            kd_lambda=0.5, kd_temperature=2.0, epochs=1, patience=1,
+            # sbatch prepare_fineweb.sh HuggingFaceTB/SmolLM2-360M 4.342e9
+            wandb_project_name="FlexLLaMA_finewebnc_kd_smollm2_360m_r12",
+        ),
+        'fineweb_nc.kd_qwen25_0p5b_warmstart_r12': make_flexllama_warmstart_kd(
+            "qwen2.5-0.5b", dataset="fineweb-edu-memmap",
+            memory_optimized=True, loss_chunk_size=512,
+            kd_lambda=0.5, kd_temperature=2.0, epochs=1, patience=1,
+            # sbatch prepare_fineweb.sh Qwen/Qwen2.5-0.5B 5.928e9   (22 GiB, uint32)
+            wandb_project_name="FlexLLaMA_finewebnc_kd_qwen25_0p5b_r12",
+        ),
+        'fineweb_nc.kd_tinyllama_warmstart_r8': make_flexllama_warmstart_kd(
+            "tinyllama-1.1b", dataset="fineweb-edu-memmap",
+            memory_optimized=True, loss_chunk_size=512,
+            kd_lambda=0.5, kd_temperature=2.0, epochs=1, patience=1,
+            # ratio 8 (speedrun setting), not 12: ratio 12 would need 12.4B tokens,
+            # past what sample-10BT holds.
+            # sbatch prepare_fineweb.sh TinyLlama/TinyLlama-1.1B-Chat-v1.0 8.276e9
+            wandb_project_name="FlexLLaMA_finewebnc_kd_tinyllama_r8",
+        ),
+        # These two exceed sample-10BT (10B tokens) at ratio 12, so prepare needs
+        # sample-100BT - and the corpus (69GiB / 38GiB) needs SCRATCH_PATH, not the
+        # home quota (see utils.fineweb_bin_dir). Both now fit in the 3.2T free there.
+        'fineweb_nc.kd_qwen25_1p5b_warmstart_r12': make_flexllama_warmstart_kd(
+            "qwen2.5-1.5b", dataset="fineweb-edu-memmap",
+            memory_optimized=True, loss_chunk_size=512,
+            kd_lambda=0.5, kd_temperature=2.0, epochs=1, patience=1,
+            batch_size=4,
+            # sbatch prepare_fineweb.sh Qwen/Qwen2.5-1.5B 1.8524553216e10 sample-100BT   (69.0 GiB, uint32)
+            wandb_project_name="FlexLLaMA_finewebnc_kd_qwen25_1p5b_r12",
+        ),
+        'fineweb_nc.kd_smollm2_1p7b_warmstart_r12': make_flexllama_warmstart_kd(
+            "smollm2-1.7b", dataset="fineweb-edu-memmap",
+            memory_optimized=True, loss_chunk_size=512,
+            kd_lambda=0.5, kd_temperature=2.0, epochs=1, patience=1,
+            batch_size=4,
+            # sbatch prepare_fineweb.sh HuggingFaceTB/SmolLM2-1.7B 2.0536492032e10 sample-100BT   (38.3 GiB, uint16)
+            wandb_project_name="FlexLLaMA_finewebnc_kd_smollm2_1p7b_r12",
+        ),
+        'fineweb.kd_lambda05_5levels': TrainerBuilder(
+            FlexLMKDTrainer,
+            FlexLLaMAConfig(
+                hidden_dims=(256, 384, 512, 640, 768),
+                num_heads=(4, 6, 8, 10, 12),
+                num_kv_heads=(4, 6, 8, 10, 12),
+                intermediate_dims=(1024, 1536, 2048, 2560, 3072),
+                pretrained_hf_model="JackFram/llama-160m",
+            ),
+            LLaMAKDTrainingContext(
+                kd_lambda=0.5,
+                kd_temperature=2.0,
+                epochs=10,
+                patience=3,
+                wandb_project_name="FlexLLaMA_fineweb_kd_lambda05_5levels",
+            ),
+        ),
+    }
+}
+
+
+def _make_web_corpus_kd(loader_fn, wandb_name, max_tokens=1_400_000_000, map_workers=1,
+                         model_config=None, teacher_hf_model="JackFram/llama-160m",
+                         tokenizer_name="JackFram/llama-160m"):
+    if model_config is None:
+        model_config = FlexLLaMAConfig(pretrained_hf_model=teacher_hf_model)
+    ctx = LLaMAKDTrainingContext(
+        kd_lambda=0.5, kd_temperature=2.0,
+        teacher_hf_model=teacher_hf_model,
+        tokenizer_name=tokenizer_name,
+        dataset="fineweb-edu",  # placeholder just to satisfy the constructor; overwritten below
+        epochs=3, patience=3,
+        wandb_project_name=wandb_name,
+    )
+    ctx.loader_function = partial(
+        loader_fn,
+        max_seq_length=1024, batch_size=8,
+        max_tokens=max_tokens,
+        tokenizer_name=tokenizer_name,
+    )
+    return TrainerBuilder(
+        FlexLMKDTrainer,
+        model_config,
+        ctx,
+    )
+
+CONFIGS['flexllama']['refinedweb.kd_lambda05_1p4B'] = _make_web_corpus_kd(
+    utils.load_refinedweb, "FlexLLaMA_refinedweb_kd_lambda05_1p4B")
+
+CONFIGS['flexllama']['gneissweb.kd_lambda05_1p4B'] = _make_web_corpus_kd(
+    utils.load_gneissweb, "FlexLLaMA_gneissweb_kd_lambda05_1p4B")
+
+CONFIGS['flexllama']['pmc.kd_lambda05_3B'] = _make_web_corpus_kd(
+    utils.load_pmc_open_access, "FlexLLaMA_pmc_kd_lambda05_3B", max_tokens=3_000_000_000)
+
+CONFIGS['flexgpt']['refinedweb.kd_lambda05_1p4B'] = _make_web_corpus_kd(
+    utils.load_refinedweb, "FlexGPT_refinedweb_kd_lambda05_1p4B",
+    model_config=FlexGPTConfig(pretrained_hf_model="gpt2"),
+    teacher_hf_model="gpt2", tokenizer_name="gpt2")
+
+CONFIGS['flexgpt']['gneissweb.kd_lambda05_1p4B'] = _make_web_corpus_kd(
+    utils.load_gneissweb, "FlexGPT_gneissweb_kd_lambda05_1p4B",
+    model_config=FlexGPTConfig(pretrained_hf_model="gpt2"),
+    teacher_hf_model="gpt2", tokenizer_name="gpt2")
+
+CONFIGS['flexllama']['pmc.full3ep'] = _make_web_corpus_kd(
+    utils.load_pmc_open_access, "FlexLLaMA_pmc_full3ep", max_tokens=3_000_000_000)
+CONFIGS['flexllama']['pmc.full3ep'].training_context.patience = 1000  # run all epochs, no early stop
+
+CONFIGS['flexllama']['pmc.full5ep'] = _make_web_corpus_kd(
+    utils.load_pmc_open_access, "FlexLLaMA_pmc_full5ep", max_tokens=3_000_000_000)
+CONFIGS['flexllama']['pmc.full5ep'].training_context.patience = 1000  # run all epochs, no early stop
+CONFIGS['flexllama']['pmc.full5ep'].training_context.epochs = 5
+
+
+from sft import register_sft_configs
+register_sft_configs(CONFIGS)

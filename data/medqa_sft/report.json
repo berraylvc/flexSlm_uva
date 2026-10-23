@@ -1,0 +1,28 @@
+{
+  "train_items_in": 193000,
+  "eval_items_checked": 6567,
+  "dropped": 26,
+  "dropped_by_reason": {
+    "13-gram overlap with medqa_test": 13,
+    "13-gram overlap with medmcqa_validation": 9,
+    "exact question+options": 4
+  },
+  "dropped_examples": [
+    "A 31-year-old woman, gravida 2, para 1, at 32 weeks' gestation comes to the emergency department for sudden leakage of clear vaginal fluid. Her pregnancy has been uncomplicated. Her first child was bo",
+    "A 55-year-old woman is brought to the emergency department because of worsening upper abdominal pain for 8 hours. She reports that the pain radiates to the back and is associated with nausea. She has ",
+    "A medical research study is evaluating an investigational novel drug (medication 1) as compared with standard therapy (medication 2) in patients presenting to the emergency department with myocardial ",
+    "A 59-year-old man is evaluated for progressive joint pain. There is swelling and tenderness over the first, second, and third metacarpophalangeal joints of both hands. His hand radiograph shows beak-l",
+    "A previously healthy 14-year-old boy is brought to the physician for evaluation because of loss of appetite, sleeplessness, and extreme irritability for 3 weeks. He recently quit the school's football",
+    "A 38-year-old woman is brought to the emergency department because of 3 1-hour episodes of severe, sharp, penetrating abdominal pain in the right upper quadrant. During these episodes, she had nausea ",
+    "A 2300-g (5-lb 1-oz) male newborn is delivered to a 29-year-old primigravid woman. The mother has HIV and received triple antiretroviral therapy during pregnancy. Her HIV viral load was 678 copies/mL ",
+    "Three days after admission to the intensive care unit for septic shock and bacteremia from a urinary tract infection, a 34-year-old woman has persistent hypotension. Her blood cultures were positive f",
+    "A 5-month-old boy is brought to the physician because of fever and a cough for 3 days. His mother reports that he has had multiple episodes of loose stools over the past 3 months. He has been treated ",
+    "You are conducting a study comparing the efficacy of two different statin medications. Two groups are placed on different statin medications, statin A and statin B. Baseline LDL levels are drawn for e"
+  ],
+  "train_out": 183326,
+  "val_out": 9648,
+  "train_out_by_source": {
+    "medmcqa_train": 173676,
+    "medqa_train": 9650
+  }
+}

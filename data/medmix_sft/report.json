@@ -1,0 +1,38 @@
+{
+  "train_in_by_source": {
+    "openlifescienceai/medqa": 11450,
+    "dvilares/head_qa": 3925,
+    "openlifescienceai/medmcqa": 182822,
+    "ncbi/MedCalc-Bench": 10543
+  },
+  "after_16gram_by_source": {
+    "openlifescienceai/medmcqa": 182707,
+    "openlifescienceai/medqa": 10389,
+    "dvilares/head_qa": 3906,
+    "ncbi/MedCalc-Bench": 10543
+  },
+  "after_cap_by_source": {
+    "openlifescienceai/medmcqa": 10000,
+    "openlifescienceai/medqa": 10000,
+    "dvilares/head_qa": 3906,
+    "ncbi/MedCalc-Bench": 10000
+  },
+  "train_out": 33406,
+  "val_out": 500,
+  "test_by_source": {
+    "dvilares/head_qa": 2675,
+    "ncbi/MedCalc-Bench": 1100,
+    "openlifescienceai/medmcqa": 4183,
+    "openlifescienceai/medqa": 1273,
+    "TsinghuaC3I/MedXpertQA": 2450,
+    "TIGER-Lab/MMLU-Pro": 818,
+    "JesseLiu/medbulltes5op": 298
+  },
+  "train_prompt_tokens": {
+    "mean": 391,
+    "p99": 1836,
+    "max": 2824,
+    "over_1024": 4284,
+    "over_2048": 172
+  }
+}
