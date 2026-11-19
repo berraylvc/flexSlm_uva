@@ -38,6 +38,9 @@ _QWEN3_FAITHMED = dict(
     lr=5e-5, warmup_ratio=0.01, epochs=1, patience=1000, batch_size=8,
     max_seq_length=3072, activation_checkpointing=True)
 
+QWEN3_REORDERED = os.path.join("hf_export", "qwen3_1p7b_reordered")
+QWEN3_REORDERED_HEADS = os.path.join("hf_export", "qwen3_1p7b_reordered_heads")
+
 # (new config name, config it starts from, overrides). A start config of None
 # warm-starts from Hugging Face weights instead (see _hf_base).
 SFT_RUNS = [
@@ -65,6 +68,52 @@ SFT_RUNS = [
         teacher_hf_model=os.path.join("hf_export", "flexxxxllamaxnsftxmmedmixxxx_qwen3_1p7b_teacher", "level2"),
         tokenizer_name="Qwen/Qwen3-1.7B",
         wandb_project_name="FlexLLaMA_sft_medmix_qwen3_flexslm")),
+    # 10 levels with SHARD's level sampling (largest, smallest and one random level
+    # in between per step). L0 keeps the size of the 3-level runs' L0 (min_frac 1/3).
+    # _shard: SHARD's progressive transfer, each level distilled from the next larger
+    # level trained in the same step, the largest level trained on the answers only.
+    ("sft.medmix_qwen3_1p7b_10L_shard", None, dict(_QWEN3_FAITHMED,
+        n_levels=10, min_frac=1 / 3, num_levels_per_step=3, transfer_type="progressive",
+        tokenizer_name="Qwen/Qwen3-1.7B",
+        wandb_project_name="FlexLLaMA_sft_medmix_qwen3_10L_shard")),
+    # Same levels and sampling, KD from the stage-1 teacher as in _flexslm.
+    ("sft.medmix_qwen3_1p7b_10L_teacher", None, dict(_QWEN3_FAITHMED,
+        n_levels=10, min_frac=1 / 3, num_levels_per_step=3,
+        teacher_hf_model=os.path.join("hf_export", "flexxxxllamaxnsftxmmedmixxxx_qwen3_1p7b_teacher", "level2"),
+        tokenizer_name="Qwen/Qwen3-1.7B",
+        wandb_project_name="FlexLLaMA_sft_medmix_qwen3_10L_teacher")),
+    # The two 10-level runs above with two changes to how the smaller levels are cut
+    # from Qwen3-1.7B: every level keeps the checkpoint's query-to-kv head pairing
+    # (keep_kv_group), and the warm start is Qwen3-1.7B with its hidden channels and
+    # MLP neurons reordered by importance (reorder_qwen3.py), so the smaller levels
+    # take the most important ones. Neither change alters the full model.
+    ("sft.medmix_qwen3_1p7b_10L_kv_shard", None, dict(_QWEN3_FAITHMED,
+        n_levels=10, min_frac=1 / 3, keep_kv_group=True, warm_start=QWEN3_REORDERED,
+        num_levels_per_step=3, transfer_type="progressive", tokenizer_name="Qwen/Qwen3-1.7B",
+        wandb_project_name="FlexLLaMA_sft_medmix_qwen3_10L_kv_shard")),
+    ("sft.medmix_qwen3_1p7b_10L_kv_teacher", None, dict(_QWEN3_FAITHMED,
+        n_levels=10, min_frac=1 / 3, keep_kv_group=True, warm_start=QWEN3_REORDERED,
+        num_levels_per_step=3,
+        teacher_hf_model=os.path.join("hf_export", "flexxxxllamaxnsftxmmedmixxxx_qwen3_1p7b_teacher", "level2"),
+        tokenizer_name="Qwen/Qwen3-1.7B",
+        wandb_project_name="FlexLLaMA_sft_medmix_qwen3_10L_kv_teacher")),
+    # _10L_kv_teacher with the attention heads reordered by importance too
+    # (reorder_qwen3.py --heads), in GQA groups so the pairing is kept.
+    ("sft.medmix_qwen3_1p7b_10L_kvh_teacher", None, dict(_QWEN3_FAITHMED,
+        n_levels=10, min_frac=1 / 3, keep_kv_group=True, warm_start=QWEN3_REORDERED_HEADS,
+        num_levels_per_step=3,
+        teacher_hf_model=os.path.join("hf_export", "flexxxxllamaxnsftxmmedmixxxx_qwen3_1p7b_teacher", "level2"),
+        tokenizer_name="Qwen/Qwen3-1.7B",
+        wandb_project_name="FlexLLaMA_sft_medmix_qwen3_10L_kvh_teacher")),
+    # _10L_kv_teacher (best so far) with more SFT data: MedMCQA capped at 60k instead
+    # of 10k (prepare_medmix_sft.py --cap); same decontamination, teacher and schedule.
+    ("sft.medmix_qwen3_1p7b_10L_kv_teacher_mcqa60k", None, dict(_QWEN3_FAITHMED,
+        data_dir=os.path.join("data", "medmix_sft_mcqa60k"),
+        n_levels=10, min_frac=1 / 3, keep_kv_group=True, warm_start=QWEN3_REORDERED,
+        num_levels_per_step=3,
+        teacher_hf_model=os.path.join("hf_export", "flexxxxllamaxnsftxmmedmixxxx_qwen3_1p7b_teacher", "level2"),
+        tokenizer_name="Qwen/Qwen3-1.7B",
+        wandb_project_name="FlexLLaMA_sft_medmix_qwen3_10L_kv_teacher_mcqa60k")),
 ]
 
 
@@ -138,12 +187,14 @@ class SFTTrainingContext(FlexTrainingContext):
     warmup_ratio: float = None
     activation_checkpointing: bool = False
     train_levels: list = None
+    transfer_type: str = None
 
     def __init__(self, load_from: str, teacher_hf_model: str, tokenizer_name: str,
                  kd_lambda=0.5, kd_temperature=2.0, num_levels_per_step=None,
                  lr=2e-5, weight_decay=0.0, epochs=3, patience=5,
                  batch_size=16, max_seq_length=1024, data_dir=SFT_DATA_DIR,
-                 warmup_ratio=None, activation_checkpointing=False, train_levels=None, **kwargs):
+                 warmup_ratio=None, activation_checkpointing=False, train_levels=None,
+                 transfer_type=None, **kwargs):
         loader = functools.partial(load_qa_sft, data_dir=data_dir, tokenizer_name=tokenizer_name,
                                    batch_size=batch_size, max_seq_length=max_seq_length)
         FlexTrainingContext.__init__(self, loader, patience=patience, epochs=epochs,
@@ -157,6 +208,9 @@ class SFTTrainingContext(FlexTrainingContext):
         self.warmup_ratio = warmup_ratio
         self.activation_checkpointing = activation_checkpointing
         self.train_levels = train_levels
+        # None: every level is distilled from teacher_hf_model. "progressive": SHARD's
+        # transfer, each level from the next larger level trained in the same step.
+        self.transfer_type = transfer_type
 
     def make_optimizer(self, model):
         return optim.AdamW(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
@@ -204,6 +258,17 @@ class FlexLMSFTTrainer(FlexLMKDTrainer):
         # weights from handle_load_from.
         if self.training_context.load_from is None:
             super().handle_pretrained_hf()
+
+    def _progressive(self) -> bool:
+        return getattr(self.training_context, "transfer_type", None) == "progressive"
+
+    def _load_teacher(self):
+        # Progressive transfer needs no external teacher.
+        return None if self._progressive() else super()._load_teacher()
+
+    def _ensure_teacher(self):
+        if not self._progressive():
+            super()._ensure_teacher()
 
     def on_fit_start(self):
         super().on_fit_start()
@@ -259,16 +324,27 @@ class FlexLMSFTTrainer(FlexLMKDTrainer):
             opt = self.optimizers()
             opt.zero_grad()
 
+        progressive = self._progressive()
         teacher_rows = None
-        if kd_lambda > 0:
+        if kd_lambda > 0 and not progressive:
             with torch.no_grad():
                 teacher_rows = self._teacher.model(input_ids).last_hidden_state[:, :-1][rows]
 
+        levels = self._select_levels(stage)
+        if progressive:
+            # Largest first, so each level's teacher (the previous one) is computed.
+            levels = sorted(levels, reverse=True)
+
         total_loss = 0.0
-        for i in self._select_levels(stage):
+        level_teacher = None  # progressive: logits of the next larger trained level
+        for i in levels:
             self.submodel.set_level_use(i)
             logits = self.submodel.lm_head(self._hidden_rows(input_ids, rows))  # [N, V]
             proxy = logits.detach().requires_grad_(True) if training else logits
+            # Progressive: the largest trained level, and every level in validation
+            # (as in SHARD), is trained on the answers only.
+            distil = teacher_rows is not None or level_teacher is not None
+            ce_weight = (1 - kd_lambda) if distil else 1.0
 
             ce_loss = kl_loss = 0.0
             correct = 0
@@ -279,10 +355,13 @@ class FlexLMSFTTrainer(FlexLMKDTrainer):
                 # sum / N reproduces the mean over the answer tokens (CE) and
                 # kl_div(reduction='batchmean') over the real tokens (KD).
                 ce_chunk = F.cross_entropy(s, t, ignore_index=IGNORE_INDEX, reduction="sum") / n_ce
-                loss_chunk = (1 - kd_lambda) * ce_chunk
-                if teacher_rows is not None:
+                loss_chunk = ce_weight * ce_chunk
+                if distil:
                     with torch.no_grad():
-                        teacher = self._teacher.lm_head(teacher_rows[start:end]).float()
+                        if teacher_rows is not None:
+                            teacher = self._teacher.lm_head(teacher_rows[start:end]).float()
+                        else:
+                            teacher = level_teacher[start:end].float()
                     kl_chunk = F.kl_div(F.log_softmax(s / T, dim=-1), F.softmax(teacher / T, dim=-1),
                                         reduction="sum") / n_kd * (T ** 2)
                     loss_chunk = loss_chunk + kd_lambda * kl_chunk
@@ -295,9 +374,11 @@ class FlexLMSFTTrainer(FlexLMKDTrainer):
 
             if training and proxy.grad is not None:
                 self.manual_backward(logits, gradient=proxy.grad)
+            if progressive and training:
+                level_teacher = logits.detach()
 
             kl_loss = kl_loss if torch.is_tensor(kl_loss) else torch.zeros((), device=input_ids.device)
-            loss = (1 - kd_lambda) * ce_loss + kd_lambda * kl_loss
+            loss = ce_weight * ce_loss + (kd_lambda * kl_loss if distil else 0.0)
             self.log(f"{stage}_level{i}_loss", loss, prog_bar=False, sync_dist=True)
             self.log(f"{stage}_level{i}_ce_loss", ce_loss, prog_bar=False, sync_dist=True)
             self.log(f"{stage}_level{i}_kl_loss", kl_loss, prog_bar=False, sync_dist=True)
@@ -355,13 +436,15 @@ def make_sft(base_name: str, base: TrainerBuilder, **overrides) -> TrainerBuilde
     return TrainerBuilder(FlexLMSFTTrainer, model_config, SFTTrainingContext(**kwargs))
 
 
-def _hf_base(preset: str) -> TrainerBuilder:
+def _hf_base(preset: str, n_levels: int = 3, min_frac: float = None,
+             keep_kv_group: bool = False) -> TrainerBuilder:
     """A FlexLLaMA whose max level is the Hugging Face model `preset`, warm-started
     from its weights and distilled from it (the TEACHER_PRESETS warm-start setup).
     config.experiments is still importing when this runs, but the function used
     here is defined before register_sft_configs is called."""
     from config.experiments import make_flexllama_warmstart_kd
-    return make_flexllama_warmstart_kd(preset, kd_lambda=0.5, kd_temperature=2.0)
+    return make_flexllama_warmstart_kd(preset, n_levels=n_levels, min_frac=min_frac,
+                                       keep_kv_group=keep_kv_group, kd_lambda=0.5, kd_temperature=2.0)
 
 
 def register_sft_configs(configs: dict) -> None:
@@ -370,11 +453,17 @@ def register_sft_configs(configs: dict) -> None:
     for name, base_name, overrides in SFT_RUNS:
         overrides = dict(overrides)
         preset = overrides.pop("hf_preset", None)
-        base = _hf_base(preset) if preset else configs.get("flexllama", {}).get(base_name)
+        levels = dict(n_levels=overrides.pop("n_levels", 3), min_frac=overrides.pop("min_frac", None),
+                      keep_kv_group=overrides.pop("keep_kv_group", False))
+        warm_start = overrides.pop("warm_start", None)
+        base = _hf_base(preset, **levels) if preset else configs.get("flexllama", {}).get(base_name)
         if base is None:
             logging.warning(f"SFT: base config flexllama,{base_name} not found, skipping {name}")
             continue
-        configs["flexllama"][name] = make_sft(base_name, base, **overrides)
+        builder = make_sft(base_name, base, **overrides)
+        if warm_start is not None:
+            builder.model_config = dataclasses.replace(builder.model_config, pretrained_hf_model=warm_start)
+        configs["flexllama"][name] = builder
 
 
 def check(only: str = None) -> None:
@@ -391,7 +480,7 @@ def check(only: str = None) -> None:
         builder = resolve_from_str(conf)
         ctx = builder.training_context
         cfg = builder.model_config
-        print(f"teacher            : {ctx.teacher_hf_model}")
+        print(f"teacher            : {ctx.teacher_hf_model}  transfer {getattr(ctx, 'transfer_type', None) or 'teacher'}")
         print(f"kd_lambda / T      : {ctx.kd_lambda} / {ctx.kd_temperature}")
         print(f"levels per step    : {ctx.num_levels_per_step or 'all'}")
         print(f"lr / epochs        : {ctx.lr} / {ctx.epochs}  warmup_ratio {ctx.warmup_ratio}  "
@@ -399,7 +488,8 @@ def check(only: str = None) -> None:
         print(f"hidden dims        : {list(cfg.hidden_dims)}  heads {list(cfg.num_heads)}  "
               f"kv {list(cfg.num_kv_heads)}  mlp {list(cfg.intermediate_dims)}")
         print(f"layers / vocab     : {cfg.num_layers} / {cfg.vocab_size}  max_seq {cfg.max_seq_length}  "
-              f"qk_norm {getattr(cfg, 'qk_norm', False)}  tie {cfg.tie_embeddings}")
+              f"qk_norm {getattr(cfg, 'qk_norm', False)}  tie {cfg.tie_embeddings}  "
+              f"kv_group {getattr(cfg, 'kv_group', None)}")
 
         if ctx.load_from is not None:
             base = resolve_from_str(f"flexllama,{base_name}")

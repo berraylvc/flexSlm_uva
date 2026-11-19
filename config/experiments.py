@@ -120,7 +120,8 @@ class LLaMAKDTrainingContext(FlexLMKDTrainingContext):
 torch.serialization.add_safe_globals([GPTTrainingContext, FlexLMKDTrainingContext, LLaMATrainingContext, LLaMAKDTrainingContext])
 
 
-def _flex_llama_dims(hidden, heads, kv_heads, intermediate, n_levels=3, min_frac=None, fractions=None):
+def _flex_llama_dims(hidden, heads, kv_heads, intermediate, n_levels=3, min_frac=None, fractions=None,
+                     kv_group=None):
     """
     Builds increasing (hidden_dims, num_heads, num_kv_heads, intermediate_dims)
     tuples for a multi-level FlexLLaMAConfig whose max level exactly matches a
@@ -132,6 +133,9 @@ def _flex_llama_dims(hidden, heads, kv_heads, intermediate, n_levels=3, min_frac
     n_levels total levels are generated: min_frac (default 1/n_levels) at the
     bottom, 1.0 (the checkpoint's real size) at the top, and n_levels - 2 more
     evenly spaced in between. Pass fractions explicitly to override this spacing.
+
+    kv_group keeps the checkpoint's GQA pairing on every level instead: a level
+    with h heads gets ceil(h / kv_group) kv heads (see RoPEAttention).
     """
     if fractions is None:
         if min_frac is None:
@@ -156,7 +160,7 @@ def _flex_llama_dims(hidden, heads, kv_heads, intermediate, n_levels=3, min_frac
             h = hs[-1] + 1
         hs.append(h)
         hd.append(h * head_dim)
-        kvs.append(kv_for(h))
+        kvs.append(-(-h // kv_group) if kv_group else kv_for(h))
 
         i_val = intermediate if is_last else min(intermediate, max(64, round(intermediate * frac / 64) * 64))
         if im and i_val <= im[-1]:
@@ -328,7 +332,8 @@ def make_flexllama_kd(teacher: str, **kd_kwargs) -> TrainerBuilder:
 
 def make_flexllama_warmstart_kd(teacher: str, n_levels: int = 3, min_frac: float = None,
                                  memory_optimized: bool = False, loss_chunk_size: int = 1024,
-                                 kd_teacher: str = None, **kd_kwargs) -> TrainerBuilder:
+                                 kd_teacher: str = None, keep_kv_group: bool = False,
+                                 **kd_kwargs) -> TrainerBuilder:
     """Same KD training algorithm as make_flexllama_kd, but the student's max
     level is built to match `teacher`'s real architecture exactly and is
     warm-started from its pretrained weights (FlexLLaMAConfig.pretrained_hf_model),
@@ -348,6 +353,11 @@ def make_flexllama_warmstart_kd(teacher: str, n_levels: int = 3, min_frac: float
     see _flex_llama_dims). Training all n_levels every step gets expensive as
     n_levels grows; pass num_levels_per_step in kd_kwargs to sample a subset per
     step instead of training every level each time.
+
+    keep_kv_group keeps the teacher's query-to-kv head pairing on every level
+    (kv_group = heads // kv_heads, see _flex_llama_dims). Without it, a level whose
+    heads-to-kv ratio differs from the checkpoint's pairs query heads with the
+    wrong pretrained kv heads.
 
     memory_optimized swaps in training_memopt.MemOptFlexLMKDTrainer (chunked loss
     + activation checkpointing). The training algorithm is unchanged and the
@@ -371,8 +381,10 @@ def make_flexllama_warmstart_kd(teacher: str, n_levels: int = 3, min_frac: float
             f"vocab_size={preset['vocab_size']}. KD requires student/teacher "
             f"logits to line up index-for-index over a shared vocab/tokenizer."
         )
+    spec = preset["dims_spec"]
+    kv_group = spec["heads"] // spec["kv_heads"] if keep_kv_group else None
     hidden_dims, num_heads, num_kv_heads, intermediate_dims = _flex_llama_dims(
-        **preset["dims_spec"], n_levels=n_levels, min_frac=min_frac)
+        **spec, n_levels=n_levels, min_frac=min_frac, kv_group=kv_group)
     kd_kwargs = _label_levels(kd_kwargs, n_levels)
     builder = TrainerBuilder(
         MemOptFlexLMKDTrainer if memory_optimized else FlexLMKDTrainer,
@@ -388,6 +400,7 @@ def make_flexllama_warmstart_kd(teacher: str, n_levels: int = 3, min_frac: float
             tie_embeddings=preset["tie_embeddings"],
             qkv_bias=preset["qkv_bias"],
             qk_norm=preset.get("qk_norm", False),
+            kv_group=kv_group,
             pretrained_hf_model=preset["hf_model"],
         ),
         LLaMAKDTrainingContext(

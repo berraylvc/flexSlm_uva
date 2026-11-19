@@ -12,6 +12,7 @@
 # Exports every level of a trained FlexLLaMA (saved_models/<config>.pt) as a
 # Hugging Face model in hf_export/<config>/ (export_flex_hf.py).
 #   sbatch export.sh flexllama,sft.medmix_qwen3_1p7b_teacher
+#   sbatch export.sh flexllama,sft.medmix_qwen3_1p7b_10L_shard 0,5,9    # only these levels
 
 CONFIG=${1:?"usage: sbatch export.sh <config>"}
 
@@ -19,4 +20,4 @@ source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate my_env
 
 cd "$SLURM_SUBMIT_DIR"
-python3 export_flex_hf.py "$CONFIG"
+python3 export_flex_hf.py "$CONFIG" ${2:+--levels "$2"}

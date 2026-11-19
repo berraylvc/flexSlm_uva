@@ -51,6 +51,7 @@ class RoPEAttention(nn.Module):
         qkv_bias: bool = False,
         qk_norm: bool = False,
         rms_norm_eps: float = 1e-6,
+        kv_group: int = None,
     ):
         super().__init__()
         hidden_dims = list(hidden_dims)
@@ -58,7 +59,14 @@ class RoPEAttention(nn.Module):
         num_kv_heads = list(num_kv_heads) if num_kv_heads is not None else list(num_heads)
         assert len(hidden_dims) == len(num_heads) == len(num_kv_heads)
         assert all(h % n == 0 for h, n in zip(hidden_dims, num_heads))
-        assert all(n % kv == 0 for n, kv in zip(num_heads, num_kv_heads))
+        # kv_group set: query head j uses kv head j // kv_group on every level, the
+        # pairing of the pretrained checkpoint, so a level needs ceil(heads / kv_group)
+        # kv heads. Otherwise each level's heads are split evenly over its kv heads.
+        self.kv_group = kv_group
+        if kv_group:
+            assert all(kv == -(-n // kv_group) for n, kv in zip(num_heads, num_kv_heads))
+        else:
+            assert all(n % kv == 0 for n, kv in zip(num_heads, num_kv_heads))
 
         self.hidden_dims = hidden_dims
         self.num_heads_list = num_heads
@@ -116,9 +124,9 @@ class RoPEAttention(nn.Module):
         q = _apply_rope(q, cos, sin)
         k = _apply_rope(k, cos, sin)
 
-        n_rep = num_heads // num_kv_heads
-        k = _repeat_kv(k, n_rep)
-        v = _repeat_kv(v, n_rep)
+        n_rep = self.kv_group or num_heads // num_kv_heads
+        k = _repeat_kv(k, n_rep)[:, :num_heads]
+        v = _repeat_kv(v, n_rep)[:, :num_heads]
 
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).contiguous().view(B, S, hidden_dim)

@@ -10,6 +10,7 @@ same head_dim, layers, vocab and RoPE.
 
     python export_flex_hf.py flexllama,sft.medmix_qwen3_1p7b             # saved_models/<config>.pt
     python export_flex_hf.py flexllama,sft.medmix_qwen3_1p7b --init hf   # untrained: the HF warm start
+    python export_flex_hf.py flexllama,sft.medmix_qwen3_1p7b_10L_shard --levels 0,5,9
 writes hf_export/<config>[.init]/level<i>/ (config, bf16 weights, tokenizer).
 """
 import argparse
@@ -26,11 +27,18 @@ def flexllama_level_state_dict(model, level: int) -> dict:
     for i, block in enumerate(model.layers):
         pfx = f"model.layers.{i}"
         attn = block.self_attn
+        heads, kv = attn.num_heads_list[level], attn.num_kv_heads_list[level]
         for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
             lin = getattr(attn, proj).make_base_copy()
-            sd[f"{pfx}.self_attn.{proj}.weight"] = lin.weight
-            if lin.bias is not None:
-                sd[f"{pfx}.self_attn.{proj}.bias"] = lin.bias
+            weight, bias = lin.weight, lin.bias
+            if proj in ("k_proj", "v_proj") and heads % kv:
+                # HF needs heads % kv_heads == 0: give every query head its own copy
+                # of the kv head it uses (j // kv_group), which computes the same.
+                weight = _per_query_head(weight, kv, attn.kv_group, heads)
+                bias = None if bias is None else _per_query_head(bias, kv, attn.kv_group, heads)
+            sd[f"{pfx}.self_attn.{proj}.weight"] = weight
+            if bias is not None:
+                sd[f"{pfx}.self_attn.{proj}.bias"] = bias
         if getattr(attn, "qk_norm", False):
             sd[f"{pfx}.self_attn.q_norm.weight"] = attn.q_norm.weight
             sd[f"{pfx}.self_attn.k_norm.weight"] = attn.k_norm.weight
@@ -45,13 +53,20 @@ def flexllama_level_state_dict(model, level: int) -> dict:
     return {k: v.detach().clone() for k, v in sd.items()}
 
 
+def _per_query_head(t, kv: int, kv_group: int, heads: int):
+    """[kv * head_dim, ...] -> [heads * head_dim, ...], query head j getting kv head j // kv_group."""
+    t = t.reshape(kv, -1, *t.shape[1:])
+    return t.repeat_interleave(kv_group, dim=0)[:heads].reshape(-1, *t.shape[2:])
+
+
 def hf_level_config(source_hf_config, cfg, level: int):
     """The source model's HF config with the widths of `level`."""
     c = source_hf_config.__class__.from_dict(source_hf_config.to_dict())
     hidden, heads = list(cfg.hidden_dims)[level], list(cfg.num_heads)[level]
     c.hidden_size = hidden
     c.num_attention_heads = heads
-    c.num_key_value_heads = list(cfg.num_kv_heads)[level]
+    kv = list(cfg.num_kv_heads)[level]
+    c.num_key_value_heads = heads if heads % kv else kv  # see flexllama_level_state_dict
     c.intermediate_size = list(cfg.intermediate_dims)[level]
     if hasattr(c, "head_dim"):
         c.head_dim = hidden // heads
@@ -81,6 +96,7 @@ def main():
     parser.add_argument("--init", choices=["trained", "hf"], default="trained",
                         help="trained: saved_models/<config>.pt; hf: the untrained Hugging Face warm start")
     parser.add_argument("--out", default=None)
+    parser.add_argument("--levels", default=None, help="comma-separated levels to export (default: all)")
     args = parser.parse_args()
 
     import utils
@@ -93,7 +109,8 @@ def main():
         model = utils.load_model(args.config, cfg)
     model.eval()
     safe = utils.make_str_filename_safe(args.config) + (".init" if args.init == "hf" else "")
-    export(model, cfg, cfg.pretrained_hf_model, args.out or os.path.join("hf_export", safe))
+    levels = [int(l) for l in args.levels.split(",")] if args.levels else None
+    export(model, cfg, cfg.pretrained_hf_model, args.out or os.path.join("hf_export", safe), levels=levels)
 
 
 if __name__ == "__main__":

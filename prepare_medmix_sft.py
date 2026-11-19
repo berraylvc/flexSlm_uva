@@ -13,6 +13,11 @@ Differences from FaithMed, all forced by what is available to us:
   - HEAD-QA is read straight from its zip, since the HF loading script no longer runs.
 
     python prepare_medmix_sft.py              # writes data/medmix_sft/
+
+More-data variant (same pipeline, only a higher cap for one source; the shuffle is
+the same, so the first 10k rows per source are the ones the default run keeps):
+
+    python prepare_medmix_sft.py --out data/medmix_sft_mcqa60k --cap openlifescienceai/medmcqa=60000
 """
 import argparse
 import ast
@@ -158,7 +163,13 @@ def main():
     parser.add_argument("--tokenizer", default="Qwen/Qwen3-1.7B")
     parser.add_argument("--val_size", type=int, default=500)
     parser.add_argument("--cache_dir", default=None, help="HF cache (default: HF_HOME)")
+    parser.add_argument("--cap", action="append", default=[], metavar="SOURCE=N",
+                        help=f"train cap for one source instead of {TRAIN_CAP} (repeatable)")
     args = parser.parse_args()
+    caps = collections.defaultdict(lambda: TRAIN_CAP)
+    for item in args.cap:
+        source, n = item.rsplit("=", 1)
+        caps[source] = int(n)
 
     train, test = load_all(args.cache_dir)
     n_in = collections.Counter(r["source"] for r in train)
@@ -178,7 +189,7 @@ def main():
 
     counts, capped = collections.Counter(), []
     for r in kept:
-        if counts[r["source"]] < TRAIN_CAP:
+        if counts[r["source"]] < caps[r["source"]]:
             capped.append(r)
             counts[r["source"]] += 1
 
